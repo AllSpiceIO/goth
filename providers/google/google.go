@@ -5,6 +5,7 @@ package google
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -97,9 +98,9 @@ func (p *Provider) containsScope(scope string) bool {
 	return false
 }
 
-func (p *Provider) listGroupsRecursive(ctx context.Context, service *admin.Service, userName string, found map[string]bool) ([]string, error) {
+func (p *Provider) listGroupsRecursive(ctx context.Context, service *admin.Service, userName, domain string, found map[string]bool) ([]string, error) {
 	groups := make([]string, 0)
-	return groups, service.Groups.List().UserKey(userName).Fields("nextPageToken", "groups(email)").Pages(ctx, func(gs *admin.Groups) error {
+	return groups, service.Groups.List().UserKey(userName).Domain(domain).Fields("nextPageToken", "groups(email)").Pages(ctx, func(gs *admin.Groups) error {
 		for _, g := range gs.Groups {
 			// check if we've already found this group
 			if _, exists := found[g.Email]; exists {
@@ -109,7 +110,7 @@ func (p *Provider) listGroupsRecursive(ctx context.Context, service *admin.Servi
 			groups = append(groups, g.Email)
 
 			// DFS for group
-			subGroups, err := p.listGroupsRecursive(ctx, service, g.Email, found)
+			subGroups, err := p.listGroupsRecursive(ctx, service, g.Email, domain, found)
 			if err != nil {
 				return err
 			}
@@ -170,17 +171,27 @@ func (p *Provider) FetchUser(session goth.Session) (goth.User, error) {
 	}
 
 	if p.containsScope("groups") {
-		adminService, err := admin.NewService(context.Background(), option.WithHTTPClient(p.Client()))
+		ctx := context.Background()
+		adminService, err := admin.NewService(ctx, option.WithHTTPClient(p.Client()))
 		if err != nil {
 			return user, err
 		}
 
-		groups, err = p.listGroupsRecursive(context.Background(), adminService, user.Name, make(map[string]bool))
+		domain, exists := user.RawData["hd"]
+		if !exists {
+			return user, errors.New("user.RawData missing 'hd'")
+		}
+
+		groups, err := p.listGroupsRecursive(ctx,
+			adminService,
+			user.Name,
+			fmt.Sprintf("%s", domain),
+			make(map[string]bool))
 		if err != nil {
 			return user, err
 		}
 
-		// TODO add groups to RawData with key (?)
+		user.RawData["groups"] = groups
 	}
 
 	return user, nil
