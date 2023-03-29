@@ -3,15 +3,20 @@
 package google
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strings"
 
-	"github.com/markbates/goth"
 	"golang.org/x/oauth2"
+	admin "google.golang.org/api/admin/directory/v1"
+	"google.golang.org/api/option"
+
+	"github.com/markbates/goth"
 )
 
 const endpointProfile string = "https://www.googleapis.com/oauth2/v2/userinfo"
@@ -84,6 +89,38 @@ type googleUser struct {
 	Picture   string `json:"picture"`
 }
 
+func (p *Provider) containsScope(scope string) bool {
+	for _, s := range p.config.Scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Provider) listGroupsRecursive(ctx context.Context, service *admin.Service, userName, domain string, found map[string]bool) ([]string, error) {
+	groups := make([]string, 0)
+	return groups, service.Groups.List().UserKey(userName).Domain(domain).Fields("nextPageToken", "groups(email)").Pages(ctx, func(gs *admin.Groups) error {
+		for _, g := range gs.Groups {
+			// check if we've already found this group
+			if _, exists := found[g.Email]; exists {
+				continue
+			}
+			found[g.Email] = true
+			groups = append(groups, g.Email)
+
+			// DFS for group
+			subGroups, err := p.listGroupsRecursive(ctx, service, g.Email, domain, found)
+			if err != nil {
+				return err
+			}
+			groups = append(groups, subGroups...)
+		}
+
+		return nil
+	})
+}
+
 // FetchUser will go to Google and access basic information about the user.
 func (p *Provider) FetchUser(session goth.Session) (goth.User, error) {
 	sess := session.(*Session)
@@ -131,6 +168,30 @@ func (p *Provider) FetchUser(session goth.Session) (goth.User, error) {
 	// Google provides other useful fields such as 'hd'; get them from RawData
 	if err := json.Unmarshal(responseBytes, &user.RawData); err != nil {
 		return user, err
+	}
+
+	if p.containsScope("groups") {
+		ctx := context.Background()
+		adminService, err := admin.NewService(ctx, option.WithHTTPClient(p.Client()))
+		if err != nil {
+			return user, err
+		}
+
+		domain, exists := user.RawData["hd"]
+		if !exists {
+			return user, errors.New("user.RawData missing 'hd'")
+		}
+
+		groups, err := p.listGroupsRecursive(ctx,
+			adminService,
+			user.Name,
+			fmt.Sprintf("%s", domain),
+			make(map[string]bool))
+		if err != nil {
+			return user, err
+		}
+
+		user.RawData["groups"] = groups
 	}
 
 	return user, nil
